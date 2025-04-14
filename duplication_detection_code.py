@@ -14,13 +14,27 @@ from collections import defaultdict
 import xgboost as xgb
 from sklearn.preprocessing import StandardScaler
 
+def decode_image_bytes(image_bytes):
+    """
+    Helper to decode image bytes (from SQLite BLOB) to a numpy array (for PIL or OpenCV).
+    Args:
+        image_bytes: Raw image bytes (e.g., from SQLite BLOB)
+    Returns:
+        image_array: Decoded numpy array (RGB, as used by PIL)
+    """
+    import numpy as np
+    from PIL import Image
+    import io
+    image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+    return image
+
 class CivicIssueDuplicateDetector:
     def __init__(self, n_clusters=None, location_threshold=0.1, text_similarity_threshold=0.8):
         """
         Initialize the duplicate detection model using unsupervised clustering
-        
+
         Args:
-            n_clusters: Number of clusters for K-means (default: None - will be determined dynamically)
+            n_clusters: Number of clusters for K-means. Should be set to the number of unique complaints with the same location area, problem type (e.g., pothole, manhole cover removed, etc.), and time of reporting. (default: None - will be determined dynamically)
             location_threshold: Max distance in km to consider location similar (default: 0.1 km = 100m)
             text_similarity_threshold: Threshold for text similarity (default: 0.8)
         """
@@ -70,15 +84,27 @@ class CivicIssueDuplicateDetector:
         self.scaler = None
         self.has_enough_data_for_xgboost = False
         
-    def extract_image_features(self, image_path):
-        """Extract image features using ResNet50"""
+    def extract_image_features(self, image_input):
+        """
+        Extract image features using ResNet50.
+        image_input can be a file path, PIL Image, or image bytes (from SQLite BLOB).
+        """
         try:
-            image = Image.open(image_path).convert('RGB')
+            if isinstance(image_input, str) and os.path.exists(image_input):
+                image = Image.open(image_input).convert('RGB')
+            elif isinstance(image_input, Image.Image):
+                image = image_input
+            elif isinstance(image_input, bytes):
+                image = decode_image_bytes(image_input)
+            else:
+                # If it's a numpy array, convert to PIL Image
+                try:
+                    image = Image.fromarray(image_input)
+                except Exception:
+                    return np.zeros(2048)
             image = self.image_transform(image).unsqueeze(0)
-            
             with torch.no_grad():
                 features = self.image_model(image)
-            
             return features.squeeze().numpy()
         except Exception as e:
             # Silent error handling
@@ -99,17 +125,16 @@ class CivicIssueDuplicateDetector:
     
     def add_report(self, report):
         """
-        Add a new report to the database
-        
-        Args:
-            report: Dictionary with 'text', 'image_path', 'location', 'issue_type'
+        Add a new report to the database.
+        report: Dictionary with at least 'text', 'location', 'issue_type', and either 'image_path', 'image_bytes', or 'image_array'.
         """
         # Extract features
-        image_features = self.extract_image_features(report['image_path'])
+        image_input = report.get('image_bytes') or report.get('image_array') or report.get('image_path')
+        image_features = self.extract_image_features(image_input)
         text_embedding = self.extract_text_features(report['text'])
         location = report['location']
         issue_type = report['issue_type']
-        
+
         # Store features and report
         index = len(self.reports_db)
         self.image_features_db.append(image_features)
@@ -117,17 +142,17 @@ class CivicIssueDuplicateDetector:
         self.location_db.append(location)
         self.issue_types_db.append(issue_type)
         self.reports_db.append(report)
-        
+
         # Add to location grid
         location_grid = self.location_to_grid(location)
         self.location_clusters[location_grid].append(index)
-        
+
         # Add to issue type clusters
         self.issue_type_clusters[issue_type].append(index)
-        
+
         # Check if we have enough data to train XGBoost
         self.check_and_train_xgboost()
-        
+
         # Return the added index
         return index
     
@@ -211,70 +236,87 @@ class CivicIssueDuplicateDetector:
     def find_duplicates(self, new_report):
         """
         Find if a new report is a duplicate of any existing report
-        
+
         Args:
-            new_report: Dictionary with 'text', 'image_path', 'location', 'issue_type'
-            
+            new_report: Dictionary with 'text', 'image_path', 'image_bytes', 'image_array', 'location', 'issue_type'
+
         Returns:
             is_duplicate: Boolean indicating if this is a duplicate
             similar_reports: List of indices of similar reports
             confidence: Confidence score of duplicate detection
         """
         # Extract features from new report
-        new_image_features = self.extract_image_features(new_report['image_path'])
+        image_input = new_report.get('image_bytes') or new_report.get('image_array') or new_report.get('image_path')
+        new_image_features = self.extract_image_features(image_input)
         new_text_embedding = self.extract_text_features(new_report['text'])
         new_location = new_report['location']
         new_issue_type = new_report['issue_type']
-        
+
         # Storage for results
         similarities = []
-        
+
         # Check each report in the database
         for idx, report in enumerate(self.reports_db):
             # Check issue type match first
             if report['issue_type'] != new_issue_type:
                 continue
-                
+
             # Check location proximity
             dist = geopy.distance.distance(new_location, self.location_db[idx]).kilometers
             if dist > self.location_threshold:
                 continue
-                
+
             # Text similarity
             text_sim = cosine_similarity([new_text_embedding], [self.text_embeddings_db[idx]])[0][0]
-            
+
             # Image similarity
             image_sim = cosine_similarity([new_image_features], [self.image_features_db[idx]])[0][0]
-            
+
             # If we have images and they're identical, give high similarity
-            image_name1 = os.path.basename(new_report['image_path'])
-            image_name2 = os.path.basename(report['image_path'])
-            same_image = image_name1 == image_name2
-            
-            # Use XGBoost model if available and we have enough data
-            if self.xgb_model is not None and self.has_enough_data_for_xgboost:
+            image_name1 = None
+            image_name2 = None
+            if 'image_path' in new_report and new_report['image_path']:
+                image_name1 = os.path.basename(new_report['image_path'])
+            if 'image_path' in report and report['image_path']:
+                image_name2 = os.path.basename(report['image_path'])
+            same_image = (image_name1 is not None and image_name2 is not None and image_name1 == image_name2)
+
+            # Use XGBoost model if available, trained, and enough data
+            if (
+                self.xgb_model is not None
+                and self.has_enough_data_for_xgboost
+                and len(self.reports_db) > 100
+            ):
                 # Create feature vector
-                features = [[text_sim, image_sim, 1.0 - min(1.0, dist/self.location_threshold),
-                           int(new_issue_type == self.issue_types_db[idx])]]
-                
+                features = [[
+                    text_sim,
+                    image_sim,
+                    1.0 - min(1.0, dist/self.location_threshold),
+                    int(new_issue_type == self.issue_types_db[idx])
+                ]]
+
                 # Scale features
                 features_scaled = self.scaler.transform(features)
-                
+
                 # Get XGBoost prediction probability
                 prob = self.xgb_model.predict_proba(features_scaled)[0][1]  # Probability of being duplicate
-                
+
                 if prob >= 0.5:  # Threshold for XGBoost confidence
                     similarities.append((idx, prob))
             else:
-                # Calculate overall similarity score using original method
-                overall_sim = 0.4 * text_sim + 0.3 * (1.0 if same_image else 0.0) + 0.3 * (1.0 - min(1.0, dist/self.location_threshold))
-                
-                if overall_sim >= 0.6:  # Threshold for duplicate
-                    similarities.append((idx, overall_sim))
-        
+                # Improved fallback similarity formula
+                location_sim = 1.0 - min(1.0, dist/self.location_threshold)
+                # If image and location are both very high, treat as duplicate regardless of text
+                if image_sim > 0.9 and location_sim > 0.9:
+                    similarities.append((idx, 1.0))
+                else:
+                    overall_sim = 0.2 * text_sim + 0.4 * image_sim + 0.4 * location_sim
+                    if overall_sim >= 0.7:  # Slightly higher threshold for robustness
+                        similarities.append((idx, overall_sim))
+
         # Sort by similarity
         similarities.sort(key=lambda x: x[1], reverse=True)
-        
+
         if similarities:
             return True, [idx for idx, _ in similarities], similarities[0][1]
         else:
@@ -329,67 +371,14 @@ class CivicIssueDuplicateDetector:
         if len(reports) >= 2:
             self.build_clusters()
 
-# Example usage
+def get_duplicate_detector(**kwargs):
+    """
+    Flask-ready helper to get a CivicIssueDuplicateDetector instance.
+    Pass kwargs to customize (e.g., n_clusters, location_threshold, text_similarity_threshold).
+    n_clusters should be set to the number of unique complaints with the same location area, problem type (e.g., pothole, manhole cover removed, etc.), and time of reporting.
+    """
+    return CivicIssueDuplicateDetector(**kwargs)
+
 if __name__ == "__main__":
-    # Initialize the detector
-    detector = CivicIssueDuplicateDetector(
-        n_clusters=10,  # Start with 10 clusters
-        location_threshold=0.1,  # 100 meters
-        text_similarity_threshold=0.7  # Text similarity threshold
-    )
-    
-    # Example reports
-    example_reports = [
-        {
-            'id': 'R001',
-            'text': 'Large pothole on Main Street causing traffic issues',
-            'image_path': '/content/bad-road-cracked.webp',
-            'location': (28.6139, 77.2090),  # Delhi coordinates
-            'issue_type': 'pothole',
-            'timestamp': '2025-04-12T14:30:00'
-        },
-        {
-            'id': 'R002',
-            'text': 'Dangerous pothole on Main St needs immediate fixing',
-            'image_path': '/content/high-angle-view-pot-hole-street_1048944-10365481.webp',
-            'location': (28.6141, 77.2088),  # Very close to first report
-            'issue_type': 'pothole',
-            'timestamp': '2025-04-12T15:45:00'
-        },
-        {
-            'id': 'R003',
-            'text': 'Broken manhole cover near central park requires repair',
-            'image_path': '/content/manhole.webp',
-            'location': (28.5355, 77.2410),  # Different location
-            'issue_type': 'manhole',
-            'timestamp': '2025-04-10T09:15:00'
-        },
-        {
-            'id': 'R004',
-            'text': 'Garbage accumulation blocking the drainage system',
-            'image_path': '/content/urban-waste-overflow-stockcake.webp',
-            'location': (28.5358, 77.2412),  # Near report 3
-            'issue_type': 'garbage',
-            'timestamp': '2025-04-10T10:30:00'
-        }
-    ]
-    
-    # Add reports to the database
-    for report in example_reports:
-        detector.add_report(report)
-    
-    # Build clusters
-    detector.build_clusters()
-    
-    # Check for duplicate
-    new_report = {
-        'text': 'There is a large pothole on Main Street that needs fixing',
-        'image_path': '/content/bad-road-cracked.webp',
-        'location': (28.6140, 77.2091),  # Very close to reports 1 and 2
-        'issue_type': 'pothole',
-        'timestamp': '2025-04-13T08:15:00'
-    }
-    
-    # Process as JSON
-    result = detector.process_json_input(new_report)
-    print(json.dumps(result, indent=2))
+    print("This module is Flask-ready. Use get_duplicate_detector() to create a detector instance.")
+    print("add_report expects a dict with 'text', 'location', 'issue_type', and either 'image_path', 'image_bytes', or 'image_array'.")
