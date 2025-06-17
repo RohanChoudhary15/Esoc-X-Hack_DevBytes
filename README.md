@@ -1,4 +1,4 @@
-# eNivaran - Smart Pothole Detection & Civic Management
+# Smart Pothole Detection & Civic Management
 
 ### Developed by Team DevBytes for ESOC-X Hackathon (Code Brown)
 
